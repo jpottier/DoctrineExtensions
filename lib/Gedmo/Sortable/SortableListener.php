@@ -15,6 +15,8 @@ use Doctrine\ORM\Proxy\Proxy;
  * since it does some additional calculations on persisted objects.
  *
  * @author Lukas Botsch <lukas.botsch@gmail.com>
+ * @author Julien Pottier <julien.pottier@isics.fr>
+ * @author Sébastien Cas <sebastien.cas@isics.fr>
  * @subpackage SortableListener
  * @package Gedmo.Sortable
  * @link http://www.gediminasm.org
@@ -22,9 +24,32 @@ use Doctrine\ORM\Proxy\Proxy;
  */
 class SortableListener extends MappedEventSubscriber
 {
-    private $relocations = array();
+    const TO_DELETE = 1;
+    const TO_INSERT = 2;
+    const TO_UPDATE = 3;
+    
+    /**
+     * @var object $em ObjectManager
+     */
+    private $objectManager;
+    
+    /**
+     * @var array $configs Configuration by meta name
+     */
+    private $configs = array();
+    
+    /**
+     * @var array $maxPositions Max positions by hash (groups)
+     */
     private $maxPositions = array();
-
+    
+    /**
+     * @var array $toProcess Informations to process
+     */
+    private $toProcess = array();
+    
+    
+    
     /**
      * Specifies the list of events to listen
      *
@@ -32,11 +57,7 @@ class SortableListener extends MappedEventSubscriber
      */
     public function getSubscribedEvents()
     {
-        return array(
-            'onFlush',
-            'loadClassMetadata',
-            'prePersist',
-        );
+        return array('onFlush', 'loadClassMetadata');
     }
 
     /**
@@ -52,419 +73,382 @@ class SortableListener extends MappedEventSubscriber
     }
 
     /**
-     * Generate slug on objects being updated during flush
-     * if they require changing
+     * Generate slug on objects being updated during flush if they require changing
      *
      * @param EventArgs $args
-     * @return void
      */
     public function onFlush(EventArgs $args)
     {
-        $ea = $this->getEventAdapter($args);
-        $om = $ea->getObjectManager();
-        $uow = $om->getUnitOfWork();
+        $this->objectManager = $this->getEventAdapter($args)->getObjectManager();
+        $uow = $this->objectManager->getUnitOfWork();
+        
+        // Add objects beeing deleted to the process list
+        foreach ($uow->getScheduledEntityDeletions() as $object) {
+            $this->addObjectToProcess($object, self::TO_DELETE);
+        }
+        // Add objects beeing inserted to the process list
+        foreach ($uow->getScheduledEntityInsertions() as $object) {
+            $this->addObjectToProcess($object, self::TO_INSERT);
+        }
+        // Add objects beeing updated to the process list
+        foreach ($uow->getScheduledEntityUpdates() as $object) {
+            $this->addObjectToProcess($object, self::TO_UPDATE);
+        }
 
-        // process all objects beeing deleted
-        foreach ($ea->getScheduledObjectDeletions($uow) as $object) {
-            $meta = $om->getClassMetadata(get_class($object));
-            if ($config = $this->getConfiguration($om, $meta->name)) {
-                $this->processDeletion($om, $config, $meta, $object);
+        // Process
+        foreach ($this->toProcess as &$info) {
+            switch ($info['operation']) {
+                case self::TO_DELETE:
+                    $this->processDeletion($info);
+                    break;
+                case self::TO_INSERT:
+                    $this->processInsertion($info);
+                    break;
             }
         }
-
-        // process all objects beeing updated
-        foreach ($ea->getScheduledObjectUpdates($uow) as $object) {
-            $meta = $om->getClassMetadata(get_class($object));
-            if ($config = $this->getConfiguration($om, $meta->name)) {
-                $this->processUpdate($om, $config, $meta, $object);
+        
+        // Recompute entity changeset for all scheduled entity
+        foreach ($this->toProcess as &$info) {
+            if ($info['operation'] == self::TO_INSERT) {
+                $uow->recomputeSingleEntityChangeSet($info['meta'], $info['object']);
             }
         }
-
-        // process all objects beeing inserted
-        foreach ($ea->getScheduledObjectInsertions($uow) as $object) {
-            $meta = $om->getClassMetadata(get_class($object));
-            if ($config = $this->getConfiguration($om, $meta->name)) {
-                $this->processInsert($om, $config, $meta, $object);
-            }
-        }
-
-        $this->processRelocations($om);
-    }
-
-    /**
-     * Update maxPositions as needed
-     */
-    public function prePersist(EventArgs $args)
-    {
-        $ea = $this->getEventAdapter($args);
-        $om = $ea->getObjectManager();
-        $uow = $om->getUnitOfWork();
-        $object = $ea->getObject();
-        $meta = $om->getClassMetadata(get_class($object));
-
-        if ($config = $this->getConfiguration($om, $meta->name)) {
-            // Get groups
-            $groups = array();
-            if (isset($config['groups'])) {
-                foreach ($config['groups'] as $group) {
-                    $groups[$group] = $meta->getReflectionProperty($group)->getValue($object);
-                }
-            }
-            // Get hash
-            $hash = $this->getHash($meta, $groups, $object, $config);
-
-            // Get max position
-            if (!isset($this->maxPositions[$hash])) {
-                $this->maxPositions[$hash] = $this->getMaxPosition($om, $meta, $config, $object);
-            }
-        }
-    }
-
-    /**
-     * Computes node positions and updates the sort field in memory and in the db
-     * @param object $em ObjectManager
-     */
-    private function processInsert($em, $config, $meta, $object)
-    {
-        $uow = $em->getUnitOfWork();
-
-        $newPosition = $meta->getReflectionProperty($config['position'])->getValue($object);
-        if (is_null($newPosition)) {
-            $newPosition = -1;
-        }
-
-        // Get groups
-        $groups = array();
-        if (isset($config['groups'])) {
-            foreach ($config['groups'] as $group) {
-                $groups[$group] = $meta->getReflectionProperty($group)->getValue($object);
-            }
-        }
-        // Get hash
-        $hash = $this->getHash($meta, $groups, $object, $config);
-
-        // Get max position
-        if (!isset($this->maxPositions[$hash])) {
-            $this->maxPositions[$hash] = $this->getMaxPosition($em, $meta, $config, $object);
-        }
-
-        // Compute position if it is negative
-        if ($newPosition < 0) {
-            $newPosition += $this->maxPositions[$hash] + 2; // position == -1 => append at end of list
-            if ($newPosition < 0) $newPosition = 0;
-        }
-
-        // Set position to max position if it is too big
-        $newPosition = min(array($this->maxPositions[$hash] + 1, $newPosition));
-
-        // Compute relocations
-        $relocation = array($hash, $config['useObjectClass'], $groups, $newPosition, -1, +1);
-
-        // Apply existing relocations
-        $applyDelta = 0;
-        if (isset($this->relocations[$hash])) {
-            foreach ($this->relocations[$hash]['deltas'] as $delta) {
-                if ($delta['start'] <= $newPosition
-                        && ($delta['stop'] > $newPosition || $delta['stop'] < 0)) {
-                    $applyDelta += $delta['delta'];
-                }
-            }
-        }
-        $newPosition += $applyDelta;
-
-        // Add relocations
-        call_user_func_array(array($this, 'addRelocation'), $relocation);
-
-        // Set new position
-        $meta->getReflectionProperty($config['position'])->setValue($object, $newPosition);
-        $uow->recomputeSingleEntityChangeSet($meta, $object);
-    }
-
-    /**
-     * Computes node positions and updates the sort field in memory and in the db
-     * @param object $em ObjectManager
-     */
-    private function processUpdate($em, $config, $meta, $object)
-    {
-        $uow = $em->getUnitOfWork();
-
-        $changed = false;
-        $changeSet = $uow->getEntityChangeSet($object);
-        if (!array_key_exists($config['position'], $changeSet)) {
-            return;
-        }
-        $oldPosition = $changeSet[$config['position']][0];
-        $newPosition = $changeSet[$config['position']][1];
-
-        $changed = $changed || $oldPosition != $newPosition;
-
-        // Get groups
-        $groups = array();
-        if (isset($config['groups'])) {
-            foreach ($config['groups'] as $group) {
-                $changed = $changed ||
-                    (array_key_exists($group, $changeSet)
-                        && $changeSet[$group][0] != $changeSet[$group][1]);
-                $groups[$group] = $meta->getReflectionProperty($group)->getValue($object);
-            }
-        }
-
-        if (!$changed) return;
-
-        // Get hash
-        $hash = $this->getHash($meta, $groups, $object, $config);
-
-        // Get max position
-        if (!isset($this->maxPositions[$hash])) {
-            $this->maxPositions[$hash] = $this->getMaxPosition($em, $meta, $config, $object);
-        }
-
-        // Compute position if it is negative
-        if ($newPosition < 0) {
-            $newPosition += $this->maxPositions[$hash] + 2; // position == -1 => append at end of list
-            if ($newPosition < 0) $newPosition = 0;
-        }
-
-        // Set position to max position if it is too big
-        $newPosition = min(array($this->maxPositions[$hash] + 1, $newPosition));
-
-        // Compute relocations
-        /*
-        CASE 1: shift backwards
-        |----0----|----1----|----2----|----3----|----4----|
-        |--node1--|--node2--|--node3--|--node4--|--node5--|
-        Update node4: setPosition(1)
-        --> Update position + 1 where position in [1,3)
-        |--node1--|--node4--|--node2--|--node3--|--node5--|
-        CASE 2: shift forward
-        |----0----|----1----|----2----|----3----|----4----|
-        |--node1--|--node2--|--node3--|--node4--|--node5--|
-        Update node2: setPosition(3)
-        --> Update position - 1 where position in (1,3]
-        |--node1--|--node3--|--node4--|--node2--|--node5--|
-        */
-        $relocation = null;
-        if ($newPosition < $oldPosition) {
-            $relocation = array($hash, $config['useObjectClass'], $groups, $newPosition, $oldPosition, +1);
-        } elseif ($newPosition > $oldPosition) {
-            $relocation = array($hash, $config['useObjectClass'], $groups, $oldPosition + 1, $newPosition + 1, -1);
-        }
-
-        // Apply existing relocations
-        $applyDelta = 0;
-        if (isset($this->relocations[$hash])) {
-            foreach ($this->relocations[$hash]['deltas'] as $delta) {
-                if ($delta['start'] <= $newPosition
-                        && ($delta['stop'] > $newPosition || $delta['stop'] < 0)) {
-                    $applyDelta += $delta['delta'];
-                }
-            }
-        }
-        $newPosition += $applyDelta;
-
-        // Add relocation
-        call_user_func_array(array($this, 'addRelocation'), $relocation);
-
-        // Set new position
-        $meta->getReflectionProperty($config['position'])->setValue($object, $newPosition);
-        $uow->recomputeSingleEntityChangeSet($meta, $object);
-    }
-
-    /**
-     * Computes node positions and updates the sort field in memory and in the db
-     * @param object $em ObjectManager
-     */
-    private function processDeletion($em, $config, $meta, $object)
-    {
-        $position = $meta->getReflectionProperty($config['position'])->getValue($object);
-
-        // Get groups
-        $groups = array();
-        if (isset($config['groups'])) {
-            foreach ($config['groups'] as $group) {
-                $groups[$group] = $meta->getReflectionProperty($group)->getValue($object);
-            }
-        }
-        // Get hash
-        $hash = $this->getHash($meta, $groups, $object, $config);
-
-        // Get max position
-        if (!isset($this->maxPositions[$hash])) {
-            $this->maxPositions[$hash] = $this->getMaxPosition($em, $meta, $config, $object);
-        }
-
-        // Add relocation
-        $this->addRelocation($hash, $config['useObjectClass'], $groups, $position, -1, -1);
-    }
-
-    private function processRelocations($em)
-    {
-        foreach ($this->relocations as $hash => $relocation) {
-            $config = $this->getConfiguration($em, $relocation['name']);
-            foreach ($relocation['deltas'] as $delta) {
-                if ($delta['start'] > $this->maxPositions[$hash] || $delta['delta'] == 0) {
-                    continue;
-                }
-                $sign = $delta['delta'] < 0 ? "-" : "+";
-                $absDelta = abs($delta['delta']);
-                $dql = "UPDATE {$relocation['name']} n";
-                $dql .= " SET n.{$config['position']} = n.{$config['position']} {$sign} {$absDelta}";
-                $dql .= " WHERE n.{$config['position']} >= {$delta['start']}";
-                // if not null, false or 0
-                if ($delta['stop'] > 0) {
-                    $dql .= " AND n.{$config['position']} < {$delta['stop']}";
-                }
-                $i = -1;
-                $params = array();
-                foreach ($relocation['groups'] as $group => $value) {
-                    if (is_null($value)) {
-                        $dql .= " AND n.{$group} IS NULL";
-                    } else {
-                        $dql .= " AND n.{$group} = :val___".(++$i);
-                        $params['val___'.$i] = $value;
-                    }
-                }
-                $q = $em->createQuery($dql);
-                $q->setParameters($params);
-                $q->getSingleScalarResult();
-                $meta = $em->getClassMetadata($relocation['name']);
-
-                // now walk through the unit of work in memory objects and sync those
-                foreach ($em->getUnitOfWork()->getIdentityMap() as $className => $objects) {
-                    // for inheritance mapped classes, only root is always in the identity map
-                    if ($className !== $meta->rootEntityName) {
-                        continue;
-                    }
-                    foreach ($objects as $object) {
-                        if ($object instanceof Proxy && !$object->__isInitialized__) {
-                            continue;
-                        }
-                        $oid = spl_object_hash($object);
-                        $pos = $meta->getReflectionProperty($config['position'])->getValue($object);
-                        $matches = $pos >= $delta['start'];
-                        $matches = $matches && ($delta['stop'] <= 0 || $pos < $delta['stop']);
-                        $value = reset($relocation['groups']);
-                        while ($matches && ($group = key($relocation['groups']))) {
-                            $gr = $meta->getReflectionProperty($group)->getValue($object);
-                            if (null === $value) {
-                                $matches = $gr === null;
-                            } else {
-                                $matches = $gr === $value;
-                            }
-                            $value = next($relocation['groups']);
-                        }
-                        if ($matches) {
-                            $meta->getReflectionProperty($config['position'])->setValue($object, $pos + $delta['delta']);
-                            $em->getUnitOfWork()->setOriginalEntityProperty($oid, $config['position'], $pos + $delta['delta']);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Clear relocations
-        $this->relocations = array();
+       
+        $this->toProcess = array();
         $this->maxPositions = array();
+        $this->configs = array();
     }
-
-    private function getHash($meta, $groups, $object, &$config)
+    
+    /**
+     * Add object to the list of objects to process 
+     *
+     * @param object $object Object
+     * @param string $operation Operation
+     */
+    private function addObjectToProcess($object, $operation)
     {
-        $data = $config['useObjectClass'];
+        $meta = $this->objectManager->getClassMetadata(get_class($object));
+        
+        if (!isset($this->configs[$meta->name])) {
+            $config = $this->getConfiguration($this->objectManager, $meta->name);
+            if (!empty($config)) {
+               $this->configs[$meta->name] = $config;  
+            }
+        }
+        
+        if (isset($this->configs[$meta->name])) {
+            $config = $this->configs[$meta->name];
+            $groups = $this->getGroups($object, $meta);
+            $hash = $this->getHash($groups, $config['useObjectClass']);
+            $identifier = spl_object_hash($object);
+            
+            // Object informations
+            $info = array('meta' => $meta, 'object' => $object, 'groups' => $groups, 'hash' => $hash, 'identifier' => $identifier, 'operation' => $operation);
+            
+            // An update = a deletion + an insertion
+            if ($operation === self::TO_UPDATE) {
+                // Get database groups and position of object
+                // and create an object with those values (object to delete)
+                $uow = $this->objectManager->getUnitOfWork();
+                $changeSet = $uow->getEntityChangeSet($object);
+                
+                // Restore old groups
+                $hasChanged = false;
+                $oldObject = clone $object;
+                if (isset($config['groups'])) {
+                    foreach ($groups as $key => $group) {
+                        if (array_key_exists($key, $changeSet) && $changeSet[$key][0] != $changeSet[$key][1]) {
+                            $meta->getReflectionProperty($key)->setValue($oldObject, $changeSet[$key][0]);
+                            $hasChanged = true;
+                        }
+                    }
+                }
+                                
+                // Restore old position
+                if (array_key_exists($config['position'], $changeSet)) {
+                    $oldPosition = $changeSet[$config['position']][0];
+                    $meta->getReflectionProperty($config['position'])->setValue($oldObject, $oldPosition);
+                    if ($changeSet[$config['position']][0] != $changeSet[$config['position']][1]) {
+                        $hasChanged = true;
+                    }
+                }
+                
+                if ($hasChanged) {
+                    // Old groups
+                    $oldGroups = $this->getGroups($oldObject, $meta);
+                    
+                    // Old hash
+                    $oldHash = $this->getHash($oldGroups, $config['useObjectClass']);
+
+                    // Old info use to delete "old" object
+                    $oldInfo = $info;
+                    $oldInfo['object'] = $oldObject;
+                    $oldInfo['groups'] = $oldGroups;
+                    $oldInfo['hash'] = $oldHash;
+                    $oldInfo['operation'] = self::TO_DELETE;
+                    $this->toProcess[] = $oldInfo;
+                    
+                    // Add "new" object to process liste for insertion
+                    $info['operation'] = self::TO_INSERT;
+                }
+            }
+
+            $this->toProcess[] = $info;
+        }
+    }
+    
+    /**
+     * Returns hash
+     *
+     * @param array $groups Groups
+     * @param string $useObjectClass Object class
+     *
+     * @return string
+     */
+    private function getHash(array $groups, $useObjectClass)
+    {
+        $data = $useObjectClass;
         foreach ($groups as $group => $val) {
             if (is_object($val)) {
                 $val = spl_object_hash($val);
             }
             $data .= $group.$val;
         }
+
         return md5($data);
     }
 
-    private function getMaxPosition($em, $meta, $config, $object)
+    /**
+     * Returns object groups
+     *
+     * @param object $object Object
+     * @param ClassMetadata $meta Class meta data
+     *
+     * @return array
+     */
+    private function getGroups($object, $meta = null)
     {
-        $uow = $em->getUnitOfWork();
-        $maxPos = null;
-
-        // Get groups
+        if (null === $meta) {
+            $meta = $this->objectManager->getClassMetadata(get_class($object));
+        }
+        
         $groups = array();
+        $config = $this->configs[$meta->name];
         if (isset($config['groups'])) {
             foreach ($config['groups'] as $group) {
                 $groups[$group] = $meta->getReflectionProperty($group)->getValue($object);
             }
         }
-
-        // Get hash
-        $hash = $this->getHash($meta, $groups, $object, $config);
-
-        // Check for cached max position
-        if (isset($this->maxPositions[$hash])) {
-            return $this->maxPositions[$hash];
-        }
-
-        // Check for groups that are associations. If the value is an object and is
-        // scheduled for insert, it has no identifier yet and is obviously new
-        // see issue #226
-        foreach ($groups as $group => $val) {
-            if (is_object($val) && $uow->isScheduledForInsert($val)) {
-                return 0;
-            }
-        }
-
-        $groups = isset($config["groups"]) ? $config["groups"] : array();
-        $qb = $em->createQueryBuilder();
-        $qb->select('MAX(n.'.$config['position'].')')
-           ->from($config['useObjectClass'], 'n');
-        $qb = $this->addGroupWhere($qb, $groups, $meta, $object);
-        $query = $qb->getQuery();
-        $query->useQueryCache(false);
-        $query->useResultCache(false);
-        $res = $query->getResult();
-        $maxPos = $res[0][1];
-        if (is_null($maxPos)) $maxPos = -1;
-        return $maxPos;
+        
+        return $groups;
     }
-
-    private function addGroupWhere($qb, $groups, $meta, $object)
-    {
-        $i = 1;
-        foreach ($groups as $group) {
-            $value = $meta->getReflectionProperty($group)->getValue($object);
-            $whereFunc = is_null($qb->getDQLPart('where')) ? 'where' : 'andWhere';
-            if (is_null($value)) {
-                $qb->{$whereFunc}($qb->expr()->isNull('n.'.$group));
-            } else {
-                $qb->{$whereFunc}('n.'.$group.' = :group__'.$i);
-                $qb->setParameter('group__'.$i, $value);
-            }
-            $i++;
-        }
-        return $qb;
-    }
-
+    
     /**
-     * Add a relocation rule
-     * @param string $hash The hash of the sorting group
-     * @param $meta The objects meta data
-     * @param array $groups The sorting groups
-     * @param int $start Inclusive index to start relocation from
-     * @param int $stop Exclusive index to stop relocation at
-     * @param int $delta The delta to add to relocated nodes
+     * Returns max position
+     *
+     * @param array $info Informations
+     *
+     * @return int
      */
-    private function addRelocation($hash, $class, $groups, $start, $stop, $delta)
+    private function getMaxPosition(array $info)
     {
-        if (!array_key_exists($hash, $this->relocations)) {
-            $this->relocations[$hash] = array('name' => $class, 'groups' => $groups, 'deltas' => array());
+        if (!isset($this->maxPositions[$info['hash']])) {
+            foreach ($info['groups'] as $group => $val) {
+                if (is_object($val) && $this->objectManager->getUnitOfWork()->isScheduledForInsert($val)) {   
+                    
+                    return $this->maxPositions[$info['hash']] = -1;
+                }
+            }
+
+            // Build request to retrieve max position
+            $config = $this->configs[$info['meta']->name];
+            $groups = isset($config['groups']) ? $config['groups'] : array();
+            $qb = $this->objectManager->createQueryBuilder();
+            $qb->select('MAX(n.'.$config['position'].')')
+               ->from($config['useObjectClass'], 'n');
+
+            $i = 1;
+            foreach ($groups as $group) {
+                $value = $info['meta']->getReflectionProperty($group)->getValue($info['object']);
+                $whereFunc = is_null($qb->getDQLPart('where')) ? 'where' : 'andWhere';
+                if (is_null($value)) {
+                    $qb->{$whereFunc}($qb->expr()->isNull('n.'.$group));
+                } else {
+                    $qb->{$whereFunc}('n.'.$group.' = :group__'.$i);
+                    $qb->setParameter('group__'.$i, $value);
+                }
+                $i++;
+            }
+            
+            $query = $qb->getQuery();
+            $query->useQueryCache(false);
+            $query->useResultCache(false);
+            $res = $query->getResult();
+            
+            $this->maxPositions[$info['hash']] = $res[0][1] === null ? -1 : $res[0][1]; 
         }
 
-        try {
-            $newDelta = array('start' => $start, 'stop' => $stop, 'delta' => $delta);
-            array_walk($this->relocations[$hash]['deltas'], function(&$val, $idx, $needle) {
-                if ($val['start'] == $needle['start'] && $val['stop'] == $needle['stop']) {
-                    $val['delta'] += $needle['delta'];
-                    throw new \Exception("Found delta. No need to add it again.");
+        return $this->maxPositions[$info['hash']];
+    }
+    
+    /**
+     * Compute new position
+     *
+     * @param array $info Informations to compute new position
+     *
+     * @return int
+     */
+    private function computeNewPosition(array $info)
+    {
+        $config = $this->configs[$info['meta']->name];
+        
+        // If new position is not defined : set -1
+        $newPosition = $info['meta']->getReflectionProperty($config['position'])->getValue($info['object']);
+        if (is_null($newPosition)) {
+            $newPosition = -1;
+        }
+        
+        // Get max position
+        $maxPosition = $this->getMaxPosition($info);
+
+        // Compute position if it is negative
+        if ($newPosition < 0) {
+            $min = -($maxPosition+2);
+            $newPosition = max($newPosition, $min) - $min;
+        }
+     
+        // Set position to max position if it is too big
+        return min($newPosition, $maxPosition+1);
+    }
+    
+    /**
+     * Computes node positions and updates the sort field in memory and in the db
+     *
+     * @param array $info Informations to process deletion
+     */
+    private function processDeletion(array &$info)
+    {
+        // Retrieve data
+        $config = $this->configs[$info['meta']->name];
+        $position = $info['meta']->getReflectionProperty($config['position'])->getValue($info['object']);
+        
+        // Relocate
+        $this->relocate($info, $position, -1);
+
+        // Decrease max position
+        if (isset($this->maxPositions[$info['hash']]) && $this->maxPositions[$info['hash']] > -1) {
+            $this->maxPositions[$info['hash']]--;
+        }
+        
+        // Synchronize objects in memory
+        $uow = $this->objectManager->getUnitOfWork();
+        foreach ($this->toProcess as &$otherInfo) {
+            // Need to synchronize object in memory ?
+            if ($info['meta']->name == $otherInfo['meta']->name && $info['hash'] == $otherInfo['hash'] && $info['identifier'] != $otherInfo['identifier']) {
+                $objectInMemoryPosition = $otherInfo['meta']->getReflectionProperty($config['position'])->getValue($otherInfo['object']);
+                if ($position <= $objectInMemoryPosition) {
+                    $otherInfo['meta']->getReflectionProperty($config['position'])->setValue($otherInfo['object'], $objectInMemoryPosition-1);
                 }
-            }, $newDelta);
-            $this->relocations[$hash]['deltas'][] = $newDelta;
-        } catch (\Exception $e) {}
+            }
+        }
+    }
+    
+    /**
+     * Computes node positions and updates the sort field in memory and in the db
+     *
+     * @param array $info Informations to process insertion
+     */
+    private function processInsertion(array &$info)
+    {
+        // Compute new position
+        $newPosition = $this->computeNewPosition($info);
+        $config = $this->configs[$info['meta']->name];
+
+        // Relocate
+        $this->relocate($info, $newPosition, 1);
+      
+        // Increase max position
+        $this->maxPositions[$info['hash']]++;
+       
+        // Synchronize objects in memory
+        $notProcessed = false;
+        foreach ($this->toProcess as &$otherInfo) {            
+            if ($info['meta']->name == $otherInfo['meta']->name && $info['hash'] == $otherInfo['hash']) {    
+                // Only deleted objects or not processed inserted objects are concerned
+                if ($info['object'] === $otherInfo['object']) {
+                    $notProcessed = true;
+                }
+                // Only if new position <= position of object in memory
+                $objectInMemoryPosition = $otherInfo['meta']->getReflectionProperty($config['position'])->getValue($otherInfo['object']);
+                if ($newPosition <= $objectInMemoryPosition) {
+                    if ((!$notProcessed && $otherInfo['operation'] == self::TO_INSERT)
+                        || $otherInfo['operation'] == self::TO_DELETE) {
+                        $otherInfo['meta']->getReflectionProperty($config['position'])->setValue($otherInfo['object'], $objectInMemoryPosition+1);
+                    }
+                }
+            }
+        }
+
+        // Set new position
+        $info['meta']->getReflectionProperty($config['position'])->setValue($info['object'], $newPosition);
+        $this->objectManager->getUnitOfWork()->recomputeSingleEntityChangeSet($info['meta'], $info['object']);
+    }
+    
+    /**
+     * Relocate
+     *
+     * @param array $info Info
+     * @param int $start Inclusive index to start relocation from
+     * @param int $delta The delta (positive or negative)
+     */
+    private function relocate(array $info, $start, $delta)
+    {
+        $uow = $this->objectManager->getUnitOfWork();
+        
+        // If a group is a new object, no relocation
+        foreach ($info['groups'] as $group => $value) {
+            if (null !== $value && $uow->isScheduledForInsert($value)) {
+                
+                return;
+            }
+        }
+
+        // Build query
+        $config = $this->configs[$info['meta']->name];
+        $sign = $delta < 0 ? '-' : '+';
+        
+        $dql = "UPDATE {$info['meta']->name} n";
+        $dql .= " SET n.{$config['position']} = n.{$config['position']} {$sign} 1";
+        $dql .= " WHERE n.{$config['position']} >= {$start}";
+        
+        // Add groups conditions
+        $i = -1;
+        $params = array();
+        foreach ($info['groups'] as $group => $value) {
+            if (null === $value) {
+                $dql .= " AND n.{$group} IS NULL";
+            } else {
+                $dql .= " AND n.{$group} = :val___".(++$i);
+                $params['val___'.$i] = $value;
+            }
+        }
+        
+        // If object is not new, add condition to ignore it 
+        if (!$uow->isScheduledForInsert($info['object'])) {
+            $identifiers = $info['meta']->getIdentifierFieldNames();
+            $values = array();
+            foreach ($identifiers as $id) {
+                $idValue = $info['meta']->getReflectionProperty($id)->getValue($info['object']);
+                if (null !== $idValue) {
+                    $dql .= " AND n.{$id} != :id___".(++$i);
+                    $params['id___'.$i] = $idValue;
+                }
+            }
+        }
+        
+        $q = $this->objectManager->createQuery($dql);
+        $q->setParameters($params);
+        $q->getSingleScalarResult();
     }
 
     /**
