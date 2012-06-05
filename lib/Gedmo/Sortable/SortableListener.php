@@ -407,7 +407,7 @@ class SortableListener extends MappedEventSubscriber
         
         // If a group is a new object, no relocation
         foreach ($info['groups'] as $group => $value) {
-            if (null !== $value && $uow->isScheduledForInsert($value)) {
+            if (null !== $value && is_object($value) && $uow->isScheduledForInsert($value)) {
                 
                 return;
             }
